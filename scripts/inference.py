@@ -1,7 +1,7 @@
 # Copyright (c) 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
+# You may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
@@ -22,6 +22,28 @@ from diffusers.utils.import_utils import is_xformers_available
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
 
+# Import super-resolution models
+from gfpgan import GFPGANer
+from basicsr.archs.codeformer_arch import CodeFormer
+from torchvision.transforms.functional import to_pil_image
+
+def apply_super_resolution(image_tensor, superres_method):
+    """Applies GFPGAN, CodeFormer, or both for super-resolution."""
+    restored_img = to_pil_image(image_tensor)
+
+    if superres_method in ["GFPGAN", "Both"]:
+        face_enhancer = GFPGANer(model_path="checkpoints/auxiliary/GFPGAN.pth", upscale=4)
+        _, _, restored_img = face_enhancer.enhance(restored_img)
+
+    if superres_method in ["CodeFormer", "Both"]:
+        codeformer = CodeFormer()
+        checkpoint = torch.load("checkpoints/auxiliary/codeformer.pth", map_location="cuda")
+        codeformer.load_state_dict(checkpoint["params_ema"])
+        codeformer = codeformer.to("cuda").eval()
+        restored_img = codeformer(torch.unsqueeze(image_tensor, 0).to("cuda"))
+        restored_img = to_pil_image(restored_img.squeeze(0).cpu())
+
+    return restored_img
 
 def main(config, args):
     # Check if the GPU supports float16
@@ -55,7 +77,7 @@ def main(config, args):
 
     unet = unet.to(dtype=dtype)
 
-    # set xformers
+    # Enable memory-efficient attention if available
     if is_xformers_available():
         unet.enable_xformers_memory_efficient_attention()
 
@@ -73,7 +95,8 @@ def main(config, args):
 
     print(f"Initial seed: {torch.initial_seed()}")
 
-    pipeline(
+    # Run lipsync pipeline
+    output_video = pipeline(
         video_path=args.video_path,
         audio_path=args.audio_path,
         video_out_path=args.video_out_path,
@@ -86,6 +109,14 @@ def main(config, args):
         height=config.data.resolution,
     )
 
+    # Apply super-resolution if enabled
+    if args.superres in ["GFPGAN", "CodeFormer", "Both"]:
+        print(f"Applying {args.superres} enhancement...")
+        output_video = apply_super_resolution(output_video, args.superres)
+
+    # Save final video
+    output_video.save(args.video_out_path)
+    print(f"Video saved with {args.superres} enhancement: {args.video_out_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -97,8 +128,9 @@ if __name__ == "__main__":
     parser.add_argument("--inference_steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1247)
-    args = parser.parse_args()
+    parser.add_argument("--superres", type=str, choices=["GFPGAN", "CodeFormer", "Both", None], default=None, help="Choose super-resolution model (GFPGAN, CodeFormer, Both)")
 
+    args = parser.parse_args()
     config = OmegaConf.load(args.unet_config_path)
 
     main(config, args)
